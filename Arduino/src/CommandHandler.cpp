@@ -33,6 +33,9 @@ void CommandHandler::handleIncomingCommand()
             command.trim();        // Remove leading/trailing whitespace
             command.toUpperCase(); // Convert to uppercase
 
+            // Serial.print("Received command: ");
+            // Serial.println(command);
+
             // Parse command and arguments
             int spaceIndex = command.indexOf(' ');
             String cmd = command.substring(0, spaceIndex);
@@ -44,9 +47,12 @@ void CommandHandler::handleIncomingCommand()
                 String toCompare = routes[i].command;
 
                 toCompare.trim();
+
                 toCompare.toUpperCase();
 
                 if (toCompare == cmd) {
+                    // Serial.print("Executing handler for command: ");
+                    // Serial.println(cmd);
                     routes[i].handler(args);
                     break;
                 }
@@ -55,15 +61,9 @@ void CommandHandler::handleIncomingCommand()
             // Reset the buffer for the next command
             bufferIndex = 0;
             memset(commandBuffer, 0, sizeof(commandBuffer));
-        } else {
-            // Add character to buffer with overflow protection
-            if (bufferIndex < COMMAND_BUFFER_SIZE - 1) {
-                commandBuffer[bufferIndex++] = incomingChar;
-            } else {
-                // Reset buffer on overflow to prevent undefined behavior
-                bufferIndex = 0;
-                memset(commandBuffer, 0, sizeof(commandBuffer));
-            }
+        } else if (bufferIndex < (sizeof(commandBuffer) - 1)) {
+            // Add character to buffer (prevent overflow)
+            commandBuffer[bufferIndex++] = incomingChar;
         }
     }
 }
@@ -72,9 +72,15 @@ void CommandHandler::handleIncomingCommand()
 void CommandHandler::sendCommand(const String &command, const String &args)
 {
     String fullCommand = command;
-    if (!args.isEmpty()) {
-        fullCommand += " ";
-        fullCommand += args;
+    if (args.length() > 0) {
+        fullCommand += " " + args;
     }
-    serial.println(fullCommand);
+
+    fullCommand += '\n'; // Add newline character
+
+    serial.print(fullCommand);
+
+    // Serial.print("Sending command: ");
+    // Serial.print(fullCommand);
+    // Serial.print('\n');
 }

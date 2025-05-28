@@ -1,30 +1,36 @@
-#include "SDReader.hpp"
-#include "WiFiConfig.hpp"
+#include "edge-impulse-sdk/dsp/image/image.hpp"
+#include <Aquabotica_plastic_fish_inferencing.h>
 
 #include "APIHandler.hpp"
 #include "CommandHandler.hpp"
+#include "EEPROMManager.hpp"
+#include "MQTTManager.hpp"
+#include "SDReader.hpp"
+#include "WiFiConfig.hpp"
 
-#include "config.h"
-#include "edge-impulse-sdk/dsp/image/image.hpp"
-#include "esp_camera.h"
-
-#include <Aquabotica_plastic_fish_inferencing.h>
+// Configuration MQTT
+#define USER_ID "aquabotica-device"
 
 // Camera configuration
 #define CAMERA_MODEL_WROVER_KIT // Has PSRAM
 
 #include "camera_pins.h"
+#include "config.h"
+#include "esp_camera.h"
+#include "fish_config.h"
 
 /* Constant defines -------------------------------------------------------- */
 #define EI_CAMERA_RAW_FRAME_BUFFER_COLS 320
 #define EI_CAMERA_RAW_FRAME_BUFFER_ROWS 240
 #define EI_CAMERA_FRAME_BYTE_SIZE 3
 
-// Instantiate CommandHandler for communication with ESP32
-CommandHandler commandHandler(Serial);
-
 SDReader sdReader;
+MQTTManager mqttManager;
 APIHandler apiHandler;
+WiFiClient espClient;
+EEPROMManager eepromManager;
+
+int configured_fish = 0;
 
 status_t status = STATUS_BOOT;
 
@@ -42,7 +48,6 @@ bool captureImage(uint8_t *snapshot_buf);
 bool processImage(uint8_t *snapshot_buf, int &detected);
 void handleBoundingBox(const ei_impulse_result_bounding_box_t &bb);
 // void logError(const String &message, int code = 0);
-void handleCapture(const String &command);
 
 static camera_config_t camera_config = {
     .pin_pwdn = PWDN_GPIO_NUM,
@@ -120,7 +125,7 @@ bool ei_camera_init(void)
 
 void handleHello(const String &command)
 {
-    commandHandler.sendCommand("READY");
+    CommandHandler::getInstance()->sendCommand("READY");
 
     if (status == STATUS_BOOT) {
         status = STATUS_SYNCED;
@@ -131,7 +136,7 @@ void handleReady(const String &command)
 {
     if (status == STATUS_BOOT) {
         status = STATUS_SYNCED;
-        commandHandler.sendCommand("READY");
+        CommandHandler::getInstance()->sendCommand("READY");
     }
 }
 
@@ -143,16 +148,18 @@ void handleInit(const String &command)
 
     status = STATUS_INIT;
 
+    Serial.println("Initializing SD card...");
+
     SDReader::err_sd_t err = sdReader.init();
 
     switch (err) {
 
     case SDReader::err_sd_t::SD_ERR_NO_SDC:
-        commandHandler.sendCommand("NO_SDC");
+        CommandHandler::getInstance()->sendCommand("NO_SDC");
         status = STATUS_NO_SDC;
         return;
     case SDReader::err_sd_t::SD_ERR_CONFIG_FILE_NOT_CREATED:
-        commandHandler.sendCommand("CONFIG_FILE_NOT_CREATED");
+        CommandHandler::getInstance()->sendCommand("CONFIG_FILE_NOT_CREATED");
         status = STATUS_CONFIG_FILE_NOT_CREATED;
         return;
     }
@@ -160,11 +167,13 @@ void handleInit(const String &command)
     // Read WiFi configuration
     WiFiConfig wifiConfig;
 
+    Serial.println("Reading WiFi configuration...");
+
     SDReader::err_read_config_t readConfErr = sdReader.readConfig(wifiConfig);
 
     switch (readConfErr) {
     case SDReader::err_read_config_t::RC_BAD_WIFI_CONFIG:
-        commandHandler.sendCommand("BAD_WIFI_CONF");
+        CommandHandler::getInstance()->sendCommand("BAD_WIFI_CONF");
         status = STATUS_BAD_WIFI_CONF;
         return;
     }
@@ -172,7 +181,7 @@ void handleInit(const String &command)
     APIHandler::err_wifi_t api_err = apiHandler.init(wifiConfig);
 
     if (api_err == APIHandler::err_wifi_t::WIFI_ERR) {
-        commandHandler.sendCommand("NO_WIFI_CONN");
+        CommandHandler::getInstance()->sendCommand("NO_WIFI_CONN");
         status = STATUS_NO_WIFI_CONN;
         return;
     }
@@ -181,7 +190,7 @@ void handleInit(const String &command)
     if (!camInit) {
         esp_camera_deinit();
         // Serial.printf("ERROR: Camera init failed with error 0x%x\n", camErr);
-        commandHandler.sendCommand("CAM_INIT_FAIL");
+        CommandHandler::getInstance()->sendCommand("CAM_INIT_FAIL");
         status = STATUS_CAM_INIT_FAIL;
         return;
     }
@@ -196,23 +205,24 @@ void handleInit(const String &command)
 
     is_initialised = true;
 
-    // APIHandler::api_response_code_t response = apiHandler.pingAPI();
+    mqttManager.begin(espClient, wifiConfig.mqttBroker.c_str());
 
-    // Serial.println("API response: " + String(response));
+    eepromManager.init();
 
-    // if (response != 200) {
-    //     commandHandler.sendCommand("NO_INTERNET");
-    //     status = STATUS_NO_INTERNET;
-    //     return;
-    // }
+    configured_fish = eepromManager.readInt(0);
 
-    commandHandler.sendCommand("INIT_SUCCESS");
+    if (configured_fish < 0 || configured_fish >= FISH_COUNT) {
+        configured_fish = 0;
+        eepromManager.writeInt(0, configured_fish);
+    }
+
+    CommandHandler::getInstance()->sendCommand("INIT_SUCCESS");
     status = STATUS_READY;
 }
 
 void statusHandler(const String &command)
 {
-    commandHandler.sendCommand("STATUS", String(status));
+    CommandHandler::getInstance()->sendCommand("STATUS", String(status));
 }
 
 bool ei_camera_capture(uint32_t img_width, uint32_t img_height,
@@ -280,7 +290,7 @@ static int ei_camera_get_data(size_t offset, size_t length, float *out_ptr)
 
 static const int captureTryCount = 5;
 
-void handleCapture(const String &command)
+void handleCapture()
 {
     const int maxRetries = 5;   // Maximum number of capture retries
     int retryCount = 0;         // Current retry attempt
@@ -296,7 +306,7 @@ void handleCapture(const String &command)
 
         if (snapshot_buf == nullptr) {
             // ei_printf("ERR: Failed to allocate snapshot buffer!\n");
-            commandHandler.sendCommand("CAPTURE_FAIL");
+            CommandHandler::getInstance()->sendCommand("CAPTURE_FAIL");
             return; // Exit if memory allocation fails
         }
 
@@ -310,7 +320,7 @@ void handleCapture(const String &command)
         if (!ei_camera_capture((size_t)EI_CLASSIFIER_INPUT_WIDTH,
                                (size_t)EI_CLASSIFIER_INPUT_HEIGHT,
                                snapshot_buf)) {
-            commandHandler.sendCommand("CAPTURE_FAIL");
+            CommandHandler::getInstance()->sendCommand("CAPTURE_FAIL");
             free(snapshot_buf);
             continue; // Retry capture
         }
@@ -320,13 +330,14 @@ void handleCapture(const String &command)
         EI_IMPULSE_ERROR err = run_classifier(&signal, &result, debug_nn);
 
         if (err != EI_IMPULSE_OK) {
-            commandHandler.sendCommand("AI_FAIL");
+            CommandHandler::getInstance()->sendCommand("AI_FAIL");
             free(snapshot_buf);
             continue; // Retry if classification fails
         }
 
 #if EI_CLASSIFIER_OBJECT_DETECTION == 1
-        for (uint32_t i = 0; i < result.bounding_boxes_count; i++) {
+        for (uint32_t i = 0; i < result.bounding_boxes_count && !labelDetected;
+             i++) {
             ei_impulse_result_bounding_box_t bb = result.bounding_boxes[i];
             if (bb.value == 0) {
                 continue; // Skip bounding boxes with zero value
@@ -334,15 +345,26 @@ void handleCapture(const String &command)
 
             // Stop retries as a label is detected
             labelDetected = true;
+            // Find the index of the fich in fish_config[].name
+            int fishIndex = -1;
 
-            // Process the detected label (e.g., fetch additional data)
-            float calories;
-            if (apiHandler.fetchData(bb.label, calories)) {
-                String args = String(bb.label) + " " + String(calories);
-                commandHandler.sendCommand("FISH_INFO", args);
-            } else {
-                commandHandler.sendCommand("CAPTURE_FAIL");
+            for (int j = 0; j < FISH_COUNT; j++) {
+                if (String(fish_config[j].name) == String(bb.label)) {
+                    fishIndex = j;
+                    break;
+                }
             }
+
+            if (fishIndex == -1) {
+                // Fish not found in the configuration
+                CommandHandler::getInstance()->sendCommand(
+                    "FISH_NOT_REGISTERED", bb.label);
+                free(snapshot_buf);
+                continue; // Retry capture
+            }
+
+            eepromManager.writeInt(0, fishIndex);
+            configured_fish = fishIndex;
             break; // Stop processing further bounding boxes
         }
 #else
@@ -377,8 +399,57 @@ void handleCapture(const String &command)
     }
 
     if (!labelDetected) {
-        commandHandler.sendCommand("FISH_NOT_RECOG");
+        CommandHandler::getInstance()->sendCommand("FISH_NOT_RECOG");
     }
+}
+
+void resetConfig()
+{
+    configured_fish = 0;
+    eepromManager.writeInt(0, 0);
+    Serial.println("Configuration reset to default (fish type 0).");
+}
+
+// The arguments should be in the format:
+// "temperature ph turbidity waterLevel lightOn"
+// Example: "25.5 7.0 0.5 50.0 1"
+// where lightOn is either 1 (on) or 0 (off)
+
+void handleSensors(const String &command)
+{
+    if (command.isEmpty()) {
+        CommandHandler::getInstance()->sendCommand("SENSORS_FAIL");
+        return;
+    }
+
+    float temperature = 0.0f;
+    float ph = 0.0f;
+    float light = 0.0f;
+    float turbidity = 0.0f;
+    int waterLevel = 0;
+    bool lightOn = false;
+
+    int firstSpace = command.indexOf(' ');
+    int secondSpace = command.indexOf(' ', firstSpace + 1);
+    int thirdSpace = command.indexOf(' ', secondSpace + 1);
+    int fourthSpace = command.indexOf(' ', thirdSpace + 1);
+    int fifthSpace = command.indexOf(' ', fourthSpace + 1);
+
+    if (firstSpace == -1 || secondSpace == -1 || thirdSpace == -1 ||
+        fourthSpace == -1 || fifthSpace == -1) {
+        CommandHandler::getInstance()->sendCommand("SENSORS_FAIL");
+        return;
+    }
+
+    temperature = command.substring(0, firstSpace).toFloat();
+    ph = command.substring(firstSpace + 1, secondSpace).toFloat();
+    light = command.substring(secondSpace + 1, thirdSpace).toFloat();
+    turbidity = command.substring(thirdSpace + 1, fourthSpace).toFloat();
+    waterLevel = command.substring(fourthSpace + 1, fifthSpace).toInt();
+    lightOn = command.substring(fifthSpace + 1) == "1";
+
+    mqttManager.publishSensorData(temperature, ph, light, turbidity, waterLevel,
+                                  lightOn, configured_fish);
 }
 
 void setup()
@@ -391,24 +462,25 @@ void setup()
     }
 
     // Register command handlers
-    commandHandler.registerRoute("HELLO", handleHello);
-    commandHandler.registerRoute("INIT", handleInit);
-    commandHandler.registerRoute("READY", handleReady);
-    commandHandler.registerRoute("STATUS", statusHandler);
-    commandHandler.registerRoute("CAPTURE", handleCapture);
+    CommandHandler::getInstance()->registerRoute("HELLO", handleHello);
+    CommandHandler::getInstance()->registerRoute("INIT", handleInit);
+    CommandHandler::getInstance()->registerRoute("READY", handleReady);
+    CommandHandler::getInstance()->registerRoute("STATUS", statusHandler);
+    CommandHandler::getInstance()->registerRoute("SENSORS", handleSensors);
 
-    commandHandler.sendCommand("HELLO");
+    CommandHandler::getInstance()->sendCommand("HELLO");
 }
 
 void loop()
 {
-    commandHandler.handleIncomingCommand(); // Handle serial commands
+    CommandHandler::getInstance()
+        ->handleIncomingCommand(); // Handle serial commands
 
     if (status == STATUS_BOOT) {
         static unsigned long lastHello = 0;
         if (millis() - lastHello > 1000) { // Send HELLO every 1 second
             lastHello = millis();
-            commandHandler.sendCommand("HELLO");
+            CommandHandler::getInstance()->sendCommand("HELLO");
         }
         return;
     }
@@ -416,4 +488,7 @@ void loop()
     if (status != STATUS_READY) {
         return; // Skip processing if the system isn't ready
     }
+
+    // Handle MQTT messages
+    mqttManager.loop();
 }

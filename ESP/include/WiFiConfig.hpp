@@ -14,4 +14,5 @@ class WiFiConfig
     std::string gateway;
     std::string ip;
     std::string mask;
+    std::string mqttBroker;
 };

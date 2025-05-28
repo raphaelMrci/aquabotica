@@ -1,6 +1,8 @@
 #include "SDReader.hpp"
 #include "SD_MMC.h"
 
+#define CONFIG_LINES_NUM 6
+
 // Initialize SD card and create the default config file if necessary
 SDReader::err_sd_t SDReader::init()
 {
@@ -34,10 +36,10 @@ SDReader::err_read_config_t SDReader::readConfig(WiFiConfig &config)
     }
 
     // Split the file content into lines
-    String lines[5];
+    String lines[CONFIG_LINES_NUM];
     int index = 0;
 
-    while (configFileContent.length() > 0 && index < 5) {
+    while (configFileContent.length() > 0 && index < CONFIG_LINES_NUM) {
         int endOfLine = configFileContent.indexOf('\n');
         if (endOfLine == -1) { // Handle the last line
             lines[index++] = configFileContent;
@@ -62,6 +64,8 @@ SDReader::err_read_config_t SDReader::readConfig(WiFiConfig &config)
             config.ip = lines[i].substring(3).c_str();
         } else if (lines[i].startsWith("MASK=")) {
             config.mask = lines[i].substring(5).c_str();
+        } else if (lines[i].startsWith("MQTT_BROKER=")) {
+            config.mqttBroker = lines[i].substring(12).c_str();
         }
     }
 
